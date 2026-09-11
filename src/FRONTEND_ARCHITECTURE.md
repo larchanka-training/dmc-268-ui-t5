@@ -1,5 +1,4 @@
 ## Структура слоёв фронтенд-приложения
-
 ```text
 src/
 ├── app/
@@ -37,4 +36,16 @@ src/
     ├── lib/
     ├── config/
     └── types/
+```
+
+## UI Kit
+```text
+shared/ui/
+├── button/
+├── badge/
+├── tooltip/
+├── collapsible/
+├── scroll-area/
+├── skeleton/
+└── code/
 ```
