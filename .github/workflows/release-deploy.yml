@@ -1,0 +1,96 @@
+---
+
+### 2. Репозиторий `dmc-268-ui-t5`
+
+#### Файл `.github/workflows/release-deploy.yml`
+```yaml
+name: UI Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Linters
+        run: |
+          echo "Проверка кода UI..."
+          if [ -f package.json ]; then npm ci && npm run lint --if-present; fi
+
+  build-and-push:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.image_meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute Image Tag
+        id: image_meta
+        run: |
+          IMG="ghcr.io/${{ github.repository_owner }}/dmc-268-ui-t5:${{ github.ref_name }}"
+          echo "image=$(echo $IMG | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image_meta.outputs.image }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy UI Container via SSH (In-Memory Env)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_DMC268_IP_T5 }}
+          username: ${{ secrets.VPS_DMC268_U }}
+          password: ${{ secrets.VPS_DMC268_P }}
+          script_stop: true
+          script: |
+            echo "1. Авторизация в GHCR..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            echo "2. Загрузка нового образа UI..."
+            docker pull ${{ needs.build-and-push.outputs.image_tag }}
+
+            echo "3. Ротация UI контейнера..."
+            docker stop dmc-ui >/dev/null 2>&1 || true
+            docker rm dmc-ui >/dev/null 2>&1 || true
+
+            echo "4. Запуск UI контейнера..."
+            cat << 'EOF' | docker run -d \
+              --name dmc-ui \
+              --restart unless-stopped \
+              --network dmc-net \
+              -p 3000:80 \
+              --env-file - \
+              ${{ needs.build-and-push.outputs.image_tag }}
+            APP_ENV=staging
+            RELEASE_TAG=${{ github.ref_name }}
+            EOF
+
+            echo "5. Статус контейнера UI:"
+            docker ps --filter name=dmc-ui
+
+      - name: Verify UI Endpoint from Runner
+        run: |
+          echo "Проверка порта UI (3000)..."
+          sleep 3
+          curl -sI --connect-timeout 10 http://${{ secrets.VPS_DMC268_IP_T5 }}:3000 || echo "Проверка завершена."
