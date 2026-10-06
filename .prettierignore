@@ -1,0 +1,5 @@
+dist
+pnpm-lock.yaml
+
+# Pre-existing document, not reformatted by the tooling setup
+docs/TEST_PLAN.md
