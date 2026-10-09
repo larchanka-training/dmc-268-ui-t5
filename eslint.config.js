@@ -19,6 +19,20 @@ export default defineConfig([
   {
     files: ['**/*.{jsx,tsx}'],
     extends: [reactHooks.configs.flat.recommended, reactRefresh.configs.vite],
+    rules: {
+      'react-refresh/only-export-components': [
+        'error',
+        {
+          allowConstantExport: true,
+          allowExportNames: [
+            'useTheme',
+            'ShikiContext',
+            'buttonVariants',
+            'badgeVariants',
+          ],
+        },
+      ],
+    },
   },
   {
     files: ['*.config.{js,mjs,ts}'],
