@@ -1,6 +1,7 @@
 import { Card, CardContent } from '@/shared/ui/card'
 import { Badge } from '@/shared/ui/badge'
 import type { FileChange } from '@/entities/diff/model/types'
+import { useDiffUiStore } from '@/entities/diff/model/diffUiStore'
 import { DiffHunk } from '@/entities/diff/ui/diff-hunk/DiffHunk'
 
 export interface DiffViewerProps {
@@ -8,6 +9,7 @@ export interface DiffViewerProps {
 }
 
 export function DiffViewer({ file }: DiffViewerProps) {
+  const viewMode = useDiffUiStore((state) => state.viewMode)
   const added = file.hunks.reduce(
     (sum, hunk) => sum + hunk.lines.filter((l) => l.type === 'add').length,
     0,
@@ -31,7 +33,12 @@ export function DiffViewer({ file }: DiffViewerProps) {
         </div>
         <div className="space-y-2">
           {file.hunks.map((hunk) => (
-            <DiffHunk key={hunk.id} hunk={hunk} lang={file.language} />
+            <DiffHunk
+              hunk={hunk}
+              key={hunk.id}
+              lang={file.language}
+              viewMode={viewMode}
+            />
           ))}
         </div>
       </CardContent>

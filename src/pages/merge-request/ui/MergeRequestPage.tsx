@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Moon, Sun } from 'lucide-react'
+import { Columns2, Moon, Rows3, Sun } from 'lucide-react'
 import { Button } from '@/shared/ui/button'
 import { Card, CardContent } from '@/shared/ui/card'
 import { useTheme } from '@/app/providers/theme-provider/ThemeProvider'
 import { getMergeRequest } from '@/entities/diff/api/getMergeRequest'
 import { useDiffUiStore } from '@/entities/diff/model/diffUiStore'
+import { MergeRequestMeta } from '@/widgets/merge-request-meta/ui/MergeRequestMeta'
 import { DiffViewer } from '@/widgets/diff-viewer/ui/DiffViewer'
 
 export function MergeRequestPage() {
   const selectedFileId = useDiffUiStore((state) => state.selectedFileId)
   const setSelectedFile = useDiffUiStore((state) => state.setSelectedFile)
+  const viewMode = useDiffUiStore((state) => state.viewMode)
+  const setViewMode = useDiffUiStore((state) => state.setViewMode)
   const simulateErrorRef = useRef(false)
   const { theme, toggleTheme } = useTheme()
   const { data, error, isError, isPending, refetch } = useQuery({
@@ -25,7 +28,8 @@ export function MergeRequestPage() {
   }, [data, selectedFileId, setSelectedFile])
 
   const selectedFile = useMemo(
-    () => data?.files.find((file) => file.id === selectedFileId) ?? data?.files[0],
+    () =>
+      data?.files.find((file) => file.id === selectedFileId) ?? data?.files[0],
     [data, selectedFileId],
   )
 
@@ -50,8 +54,8 @@ export function MergeRequestPage() {
             Merge request
           </h1>
           <p className="mt-4 max-w-2xl text-muted-foreground">
-            Просмотрщик дифа с подсветкой синтаксиса (Shiki), inline-комментариями
-            ревьюера и раскрывающимся контекстом.
+            Просмотрщик дифа с подсветкой синтаксиса (Shiki),
+            inline-комментариями ревьюера и раскрывающимся контекстом.
           </p>
         </div>
         <Button
@@ -71,32 +75,55 @@ export function MergeRequestPage() {
       </header>
 
       {data && (
-        <p className="mb-6 text-lg font-semibold">
-          {data.title}
-          <span className="ml-3 text-sm font-normal text-muted-foreground">
-            автор: {data.author}
-          </span>
-        </p>
+        <div className="mb-6">
+          <MergeRequestMeta mergeRequest={data} />
+        </div>
       )}
 
-      {data && data.files.length > 1 && (
-        <nav aria-label="Файлы" className="mb-6 flex flex-wrap gap-2">
-          {data.files.map((file) => (
+      {data && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+          <nav aria-label="Файлы" className="flex flex-wrap gap-2">
+            {data.files.map((file) => (
+              <Button
+                aria-pressed={file.id === (selectedFileId ?? data.files[0]?.id)}
+                key={file.id}
+                onClick={() => setSelectedFile(file.id)}
+                size="sm"
+                variant={
+                  file.id === (selectedFileId ?? data.files[0]?.id)
+                    ? 'default'
+                    : 'secondary'
+                }
+              >
+                {file.newPath}
+              </Button>
+            ))}
+          </nav>
+          <div
+            aria-label="Режим отображения диффа"
+            className="flex gap-1 rounded-lg border p-1"
+            role="group"
+          >
             <Button
-              aria-pressed={file.id === (selectedFileId ?? data.files[0]?.id)}
-              key={file.id}
-              onClick={() => setSelectedFile(file.id)}
+              aria-pressed={viewMode === 'unified'}
+              onClick={() => setViewMode('unified')}
               size="sm"
-              variant={
-                file.id === (selectedFileId ?? data.files[0]?.id)
-                  ? 'default'
-                  : 'secondary'
-              }
+              variant={viewMode === 'unified' ? 'default' : 'ghost'}
             >
-              {file.newPath}
+              <Rows3 aria-hidden="true" size={14} />
+              Unified
             </Button>
-          ))}
-        </nav>
+            <Button
+              aria-pressed={viewMode === 'split'}
+              onClick={() => setViewMode('split')}
+              size="sm"
+              variant={viewMode === 'split' ? 'default' : 'ghost'}
+            >
+              <Columns2 aria-hidden="true" size={14} />
+              Side-by-side
+            </Button>
+          </div>
+        </div>
       )}
 
       {isPending && (

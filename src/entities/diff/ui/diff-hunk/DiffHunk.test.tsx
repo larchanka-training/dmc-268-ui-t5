@@ -7,7 +7,9 @@ import { useDiffUiStore } from '../../model/diffUiStore'
 vi.mock('@/shared/lib/shiki/useShiki', () => ({
   useShiki: vi.fn(() => ({
     highlighter: {
-      codeToTokensBase: (code: string) => [[{ content: code, color: undefined }]],
+      codeToTokensBase: (code: string) => [
+        [{ content: code, color: undefined }],
+      ],
     },
     ready: true,
     shikiTheme: 'github-light',
@@ -65,13 +67,17 @@ describe('DiffHunk', () => {
     expect(screen.queryByText('before')).not.toBeInTheDocument()
     expect(screen.queryByText('after')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Раскрыть контекст' })[0])
+    fireEvent.click(
+      screen.getAllByRole('button', { name: 'Раскрыть контекст' })[0],
+    )
   })
 
   it('reveals context lines after toggling', () => {
     render(<DiffHunk hunk={hunk} lang="typescript" />)
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Раскрыть контекст' })[0])
+    fireEvent.click(
+      screen.getAllByRole('button', { name: 'Раскрыть контекст' })[0],
+    )
 
     expect(screen.getByText('before')).toBeInTheDocument()
     expect(screen.getByText('after')).toBeInTheDocument()
@@ -83,5 +89,61 @@ describe('DiffHunk', () => {
     expect(screen.getByTestId('inline-comment')).toBeInTheDocument()
     expect(screen.getByText('Мария')).toBeInTheDocument()
     expect(screen.getByText('комментарий')).toBeInTheDocument()
+  })
+
+  it('renders unified rows by default', () => {
+    render(<DiffHunk hunk={hunk} lang="typescript" />)
+
+    expect(screen.getAllByTestId('diff-line').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('diff-line-pair')).not.toBeInTheDocument()
+  })
+
+  it('renders side-by-side pairs in split mode with full-width comments', () => {
+    render(<DiffHunk hunk={hunk} lang="typescript" viewMode="split" />)
+
+    const pairs = screen.getAllByTestId('diff-line-pair')
+    expect(pairs.length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('diff-line')).not.toBeInTheDocument()
+
+    const commentPair = pairs.find((pair) =>
+      pair.querySelector('[data-testid="inline-comment"]'),
+    )
+    expect(commentPair).toBeDefined()
+    expect(
+      commentPair?.querySelector('[data-testid="inline-comment"]'),
+    ).toBeVisible()
+  })
+
+  it('anchors an old-side comment to the deleted line in split mode', () => {
+    render(
+      <DiffHunk
+        hunk={{
+          ...hunk,
+          lines: [
+            { type: 'delete', oldNumber: 10, content: 'removed' },
+            { type: 'add', newNumber: 11, content: 'added' },
+          ],
+          comments: [
+            {
+              id: 9,
+              line: 10,
+              side: 'old',
+              author: 'GitLab Duo',
+              body: 'замечание на удалённой строке',
+              status: 'unresolved',
+              isAI: true,
+              severity: 'info',
+            },
+          ],
+        }}
+        lang="typescript"
+        viewMode="split"
+      />,
+    )
+
+    expect(
+      screen.getByText('замечание на удалённой строке'),
+    ).toBeInTheDocument()
+    expect(screen.getByTestId('severity-badge-info')).toBeInTheDocument()
   })
 })
