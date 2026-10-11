@@ -152,7 +152,7 @@ describe('App (MergeRequestPage)', () => {
     renderApp()
 
     expect(await screen.findByText('const a = 1')).toBeInTheDocument()
-    expect(screen.getByTestId('diff-viewer')).toBeInTheDocument()
+    expect(screen.getAllByTestId('diff-viewer')).toHaveLength(2)
     expect(screen.getByText('Мария')).toBeInTheDocument()
     expect(screen.getByText('комментарий ревьюера')).toBeInTheDocument()
   })
@@ -185,15 +185,29 @@ describe('App (MergeRequestPage)', () => {
     expect(screen.queryByTestId('diff-line-pair')).not.toBeInTheDocument()
   })
 
-  it('switches between files', async () => {
+  it('renders every file diff in a single scroll and navigates via the file tree', async () => {
     renderApp()
 
     await screen.findByText('const a = 1')
-    fireEvent.click(
-      screen.getByRole('button', { name: 'src/shared/lib/utils.ts' }),
-    )
-
     expect(screen.getByText('export function cn() {}')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'utils.ts' }))
+
+    expect(useDiffUiStore.getState().selectedFileId).toBe('src-utils-ts')
+  })
+
+  it('renders the file tree with nested directories', async () => {
+    renderApp()
+
+    await screen.findByText('const a = 1')
+
+    expect(screen.getByTestId('file-tree')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'src' })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    )
+    expect(screen.getByRole('button', { name: 'store.ts' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'lib' })).toBeInTheDocument()
   })
 
   it('toggles the theme and persists it', async () => {

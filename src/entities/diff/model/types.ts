@@ -6,6 +6,8 @@ export type Severity = 'critical' | 'warning' | 'info'
 
 export type DiffViewMode = 'unified' | 'split'
 
+export type FileChangeStatus = 'modified' | 'added' | 'deleted' | 'renamed'
+
 export type ReviewStatus = 'completed' | 'in_progress'
 
 export type ReviewVerdict = 'approve' | 'changes_requested' | 'comment'
@@ -46,6 +48,7 @@ export type FileChange = {
   oldPath: string
   newPath: string
   language: string
+  status?: FileChangeStatus
   hunks: Hunk[]
 }
 
