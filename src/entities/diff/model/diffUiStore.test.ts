@@ -25,4 +25,20 @@ describe('useDiffUiStore', () => {
     useDiffUiStore.getState().setSelectedFile('file-1')
     expect(useDiffUiStore.getState().selectedFileId).toBe('file-1')
   })
+
+  it('starts in unified view mode', () => {
+    useDiffUiStore.setState({ viewMode: 'unified' })
+
+    expect(useDiffUiStore.getState().viewMode).toBe('unified')
+  })
+
+  it('switches the view mode', () => {
+    useDiffUiStore.setState({ viewMode: 'unified' })
+
+    useDiffUiStore.getState().setViewMode('split')
+    expect(useDiffUiStore.getState().viewMode).toBe('split')
+
+    useDiffUiStore.getState().setViewMode('unified')
+    expect(useDiffUiStore.getState().viewMode).toBe('unified')
+  })
 })
