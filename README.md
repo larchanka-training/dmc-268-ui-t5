@@ -36,6 +36,12 @@ Managed by Husky (installed automatically by `pnpm install`):
 - **pre-commit** — ESLint on staged `*.{js,jsx,ts,tsx}` files via lint-staged; errors block the commit.
 - **pre-push** — `pnpm check-types`, `pnpm lint`, `pnpm build`; any failure blocks the push.
 
+## CI/CD
+
+- `.github/workflows/ci.yml` — `pnpm lint`, `pnpm check-types`, `pnpm test` on every pull request and before each deploy.
+- `.github/workflows/branch-name.yml` — branch must be `<type>/<short-name>` (`feat`, `feature`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`, `hotfix`), checked on every pull request and before each deploy.
+- Push to `main` deploys production, push to `develop` deploys staging. Any branch can be deployed manually: Actions -> UI Release Pipeline -> Run workflow, pick the branch and the environment. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## State management
 
 - TanStack Query отвечает за серверные данные review-комментариев.

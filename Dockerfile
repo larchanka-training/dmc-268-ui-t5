@@ -4,6 +4,9 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --ignore-scripts
 COPY . .
+# Same-origin: Caddy проксирует /api/* в API, CORS не нужен
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
 RUN pnpm build
 
 FROM nginx:alpine
