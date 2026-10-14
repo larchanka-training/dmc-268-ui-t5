@@ -18,19 +18,12 @@
 
 | Название секрета | Назначение |
 | :--- | :--- |
-| `VPS_DMC268_IP_T5` | IP-адрес сервера Hetzner |
+| `VPS_DMC268_IP_T5` (Variable, не Secret) | IP-адрес сервера Hetzner |
 | `VPS_DMC268_U` | SSH-пользователь |
 | `VPS_DMC268_P` | Пароль пользователя SSH |
 
 ---
 
-## 3. Выпуск релиза UI
+## 3. Автодеплой UI
 
-Создайте тег версии и отправьте его в репозиторий:
-
-```bash
-git checkout main
-git pull origin main
-
-git tag v1.0.0
-git push origin v1.0.0
+Пуш в `develop` деплоит `dmc-ui-staging` (порт 3100, Environment `staging`), пуш в `main` — `dmc-ui-prod` (порт 3000, Environment `production`). Образ собирается из `Dockerfile` (Vite + nginx), тег — SHA коммита, при падении проверки выполняется откат на предыдущий контейнер.

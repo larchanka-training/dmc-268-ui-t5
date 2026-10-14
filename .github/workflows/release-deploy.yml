@@ -1,25 +1,27 @@
----
-
-### 2. Репозиторий `dmc-268-ui-t5`
-
-#### Файл `.github/workflows/release-deploy.yml`
-```yaml
 name: UI Release Pipeline
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [ main, develop, 'feature/**' ]
+
+concurrency:
+  group: deploy-${{ github.ref_name == 'main' && 'prod' || 'staging' }}
+  cancel-in-progress: false
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run Linters
-        run: |
-          echo "Проверка кода UI..."
-          if [ -f package.json ]; then npm ci && npm run lint --if-present; fi
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm check-types
+      - run: pnpm test
 
   build-and-push:
     needs: lint
@@ -28,69 +30,83 @@ jobs:
       contents: read
       packages: write
     outputs:
-      image_tag: ${{ steps.image_meta.outputs.image }}
+      image: ${{ steps.meta.outputs.image }}
+      environment: ${{ steps.meta.outputs.environment }}
+      suffix: ${{ steps.meta.outputs.suffix }}
+      port: ${{ steps.meta.outputs.port }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute Image Tag
-        id: image_meta
+      - name: Compute image tag and target environment
+        id: meta
         run: |
-          IMG="ghcr.io/${{ github.repository_owner }}/dmc-268-ui-t5:${{ github.ref_name }}"
+          IMG="ghcr.io/${{ github.repository_owner }}/dmc-268-ui-t5:${{ github.sha }}"
           echo "image=$(echo $IMG | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            { echo "environment=production"; echo "suffix=prod"; echo "port=3000"; } >> $GITHUB_OUTPUT
+          else
+            { echo "environment=staging"; echo "suffix=staging"; echo "port=3100"; } >> $GITHUB_OUTPUT
+          fi
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.image_meta.outputs.image }}
+          tags: ${{ steps.meta.outputs.image }}
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-push.outputs.environment }}
     steps:
-      - name: Deploy UI Container via SSH (In-Memory Env)
+      - name: Deploy UI container via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_DMC268_IP_T5 }}
+          host: ${{ vars.VPS_DMC268_IP_T5 }}
           username: ${{ secrets.VPS_DMC268_U }}
           password: ${{ secrets.VPS_DMC268_P }}
           script_stop: true
           script: |
-            echo "1. Авторизация в GHCR..."
+            IMAGE="${{ needs.build-and-push.outputs.image }}"
+            NAME="dmc-ui-${{ needs.build-and-push.outputs.suffix }}"
+            PORT="${{ needs.build-and-push.outputs.port }}"
+
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull "$IMAGE"
 
-            echo "2. Загрузка нового образа UI..."
-            docker pull ${{ needs.build-and-push.outputs.image_tag }}
+            docker rm -f "${NAME}-prev" >/dev/null 2>&1 || true
+            HAS_PREV=0
+            if docker inspect "$NAME" >/dev/null 2>&1; then
+              docker stop "$NAME"; docker rename "$NAME" "${NAME}-prev"; HAS_PREV=1
+            fi
 
-            echo "3. Ротация UI контейнера..."
-            docker stop dmc-ui >/dev/null 2>&1 || true
-            docker rm dmc-ui >/dev/null 2>&1 || true
+            rollback() {
+              echo "ОШИБКА: UI не запустился, откат..."
+              docker rm -f "$NAME" >/dev/null 2>&1 || true
+              [ "$HAS_PREV" = "1" ] && docker rename "${NAME}-prev" "$NAME" && docker start "$NAME"
+              exit 1
+            }
 
-            echo "4. Запуск UI контейнера..."
-            cat << 'EOF' | docker run -d \
-              --name dmc-ui \
-              --restart unless-stopped \
-              --network dmc-net \
-              -p 3000:80 \
-              --env-file - \
-              ${{ needs.build-and-push.outputs.image_tag }}
-            APP_ENV=staging
-            RELEASE_TAG=${{ github.ref_name }}
-            EOF
+            docker run -d --name "$NAME" --restart unless-stopped \
+              --network dmc-net -p "${PORT}:80" "$IMAGE" || rollback
 
-            echo "5. Статус контейнера UI:"
+            HEALTHY=0
+            for i in $(seq 1 20); do
+              if curl -fsSI "http://localhost:${PORT}" >/dev/null 2>&1; then HEALTHY=1; break; fi
+              sleep 1
+            done
+            [ "$HEALTHY" = "1" ] || rollback
+
+            docker rm -f "${NAME}-prev" >/dev/null 2>&1 || true
             docker ps --filter name=dmc-ui
 
-      - name: Verify UI Endpoint from Runner
+      - name: Verify UI from runner
         run: |
-          echo "Проверка порта UI (3000)..."
-          sleep 3
-          curl -sI --connect-timeout 10 http://${{ secrets.VPS_DMC268_IP_T5 }}:3000 || echo "Проверка завершена."
+          curl -fsSI --connect-timeout 10 --retry 5 --retry-delay 3 --retry-all-errors \
+            http://${{ vars.VPS_DMC268_IP_T5 }}:${{ needs.build-and-push.outputs.port }}
