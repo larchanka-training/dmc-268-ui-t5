@@ -1,96 +1,168 @@
----
-
-### 2. Репозиторий `dmc-268-ui-t5`
-
-#### Файл `.github/workflows/release-deploy.yml`
-```yaml
 name: UI Release Pipeline
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [ main, develop ]
+  # Ручной деплой любой ветки: ветка выбирается в "Use workflow from", окружение - во входе
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [ staging, production ]
+        default: staging
+
+concurrency:
+  # На push inputs.environment пустой: окружение определяется веткой
+  group: deploy-${{ inputs.environment || (github.ref_name == 'main' && 'production' || 'staging') }}
+  cancel-in-progress: false
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Linters
-        run: |
-          echo "Проверка кода UI..."
-          if [ -f package.json ]; then npm ci && npm run lint --if-present; fi
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  branch-name:
+    uses: ./.github/workflows/branch-name.yml
 
   build-and-push:
-    needs: lint
+    needs: [checks, branch-name]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     outputs:
-      image_tag: ${{ steps.image_meta.outputs.image }}
+      image: ${{ steps.meta.outputs.image }}
+      environment: ${{ steps.meta.outputs.environment }}
+      suffix: ${{ steps.meta.outputs.suffix }}
+      url: ${{ steps.meta.outputs.url }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute Image Tag
-        id: image_meta
+      - name: Compute image tag and target environment
+        id: meta
+        env:
+          APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+          VPS_IP: ${{ vars.VPS_DMC268_IP_T5 }}
+          TARGET: ${{ inputs.environment || (github.ref_name == 'main' && 'production' || 'staging') }}
         run: |
-          IMG="ghcr.io/${{ github.repository_owner }}/dmc-268-ui-t5:${{ github.ref_name }}"
+          IMG="ghcr.io/${{ github.repository_owner }}/dmc-268-ui-t5:${{ github.sha }}"
           echo "image=$(echo $IMG | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          if [ "$TARGET" = "production" ]; then
+            ENVIRONMENT=production; SUFFIX=prod; HOST_PREFIX=""
+          else
+            ENVIRONMENT=staging; SUFFIX=staging; HOST_PREFIX="staging."
+          fi
+          # Тот же домен, что в terraform/main.tf репозитория API: APP_DOMAIN или <ip-через-дефисы>.sslip.io
+          DOMAIN="${APP_DOMAIN:-$(echo "$VPS_IP" | tr . -).sslip.io}"
+          { echo "environment=$ENVIRONMENT"; echo "suffix=$SUFFIX"; echo "url=https://${HOST_PREFIX}${DOMAIN}"; } >> $GITHUB_OUTPUT
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.image_meta.outputs.image }}
+          tags: ${{ steps.meta.outputs.image }}
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-push.outputs.environment }}
     steps:
-      - name: Deploy UI Container via SSH (In-Memory Env)
+      - name: Deploy UI container via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ vars.VPS_DMC268_IP_T5 }}
+          username: ${{ secrets.VPS_DMC268_U }}
+          password: ${{ secrets.VPS_DMC268_P }}
+          envs: GHCR_TOKEN
+          script_stop: true
+          script: |
+            IMAGE="${{ needs.build-and-push.outputs.image }}"
+            NAME="dmc-ui-${{ needs.build-and-push.outputs.suffix }}"
+
+            echo "1. Загрузка образа из GHCR (учетные данные удаляются сразу после pull)..."
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull "$IMAGE"
+            docker logout ghcr.io >/dev/null
+
+            echo "2. Ротация контейнера (старый сохраняется для отката)..."
+            docker rm -f "${NAME}-prev" >/dev/null 2>&1 || true
+            HAS_PREV=0
+            if docker inspect "$NAME" >/dev/null 2>&1; then
+              docker stop "$NAME"; docker rename "$NAME" "${NAME}-prev"; HAS_PREV=1
+            fi
+
+            rollback() {
+              echo "ОШИБКА: UI не запустился, откат..."
+              docker logs --tail 50 "$NAME" 2>&1 || true
+              docker rm -f "$NAME" >/dev/null 2>&1 || true
+              if [ "$HAS_PREV" = "1" ]; then
+                docker rename "${NAME}-prev" "$NAME" && docker start "$NAME"
+                echo "Откат выполнен: запущена предыдущая версия."
+              else
+                echo "Предыдущей версии нет, откатываться некуда."
+              fi
+              exit 1
+            }
+
+            echo "3. Запуск UI (порт наружу не публикуется, трафик идет через Caddy)..."
+            docker network inspect dmc-net >/dev/null 2>&1 || docker network create dmc-net
+            docker inspect dmc-caddy >/dev/null 2>&1 || echo "ВНИМАНИЕ: нет контейнера dmc-caddy, UI будет недоступен снаружи. Запустите workflow Terraform Deploy to VPS в репозитории API."
+            docker run -d --name "$NAME" --restart unless-stopped \
+              --network dmc-net "$IMAGE" || rollback
+
+            echo "4. Проверка UI внутри контейнера (до 20 секунд)..."
+            HEALTHY=0
+            for i in $(seq 1 20); do
+              if docker exec "$NAME" wget -q -O /dev/null http://127.0.0.1/ >/dev/null 2>&1; then HEALTHY=1; break; fi
+              sleep 1
+            done
+            [ "$HEALTHY" = "1" ] || rollback
+
+            echo "Успех. Резервный контейнер остается до проверки с раннера."
+            docker ps --filter name=dmc-ui
+
+      - name: Verify UI from runner (via Caddy, HTTPS)
+        id: verify
+        run: |
+          # Первый запрос к новому домену может ждать выпуска сертификата
+          curl -fsSI --connect-timeout 10 --retry 10 --retry-delay 6 --retry-all-errors \
+            "${{ needs.build-and-push.outputs.url }}/"
+
+      - name: Remove backup container and old images
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_DMC268_IP_T5 }}
+          host: ${{ vars.VPS_DMC268_IP_T5 }}
           username: ${{ secrets.VPS_DMC268_U }}
           password: ${{ secrets.VPS_DMC268_P }}
           script_stop: true
           script: |
-            echo "1. Авторизация в GHCR..."
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            echo "2. Загрузка нового образа UI..."
-            docker pull ${{ needs.build-and-push.outputs.image_tag }}
-
-            echo "3. Ротация UI контейнера..."
-            docker stop dmc-ui >/dev/null 2>&1 || true
-            docker rm dmc-ui >/dev/null 2>&1 || true
-
-            echo "4. Запуск UI контейнера..."
-            cat << 'EOF' | docker run -d \
-              --name dmc-ui \
-              --restart unless-stopped \
-              --network dmc-net \
-              -p 3000:80 \
-              --env-file - \
-              ${{ needs.build-and-push.outputs.image_tag }}
-            APP_ENV=staging
-            RELEASE_TAG=${{ github.ref_name }}
-            EOF
-
-            echo "5. Статус контейнера UI:"
+            NAME="dmc-ui-${{ needs.build-and-push.outputs.suffix }}"
+            docker rm -f "${NAME}-prev" >/dev/null 2>&1 || true
+            # Образы, которые использует контейнер или сервис, не удаляются; 24h - запас для параллельного деплоя
+            docker image prune -af --filter "until=24h"
             docker ps --filter name=dmc-ui
 
-      - name: Verify UI Endpoint from Runner
-        run: |
-          echo "Проверка порта UI (3000)..."
-          sleep 3
-          curl -sI --connect-timeout 10 http://${{ secrets.VPS_DMC268_IP_T5 }}:3000 || echo "Проверка завершена."
+      - name: Roll back after failed runner check
+        if: failure() && steps.verify.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.VPS_DMC268_IP_T5 }}
+          username: ${{ secrets.VPS_DMC268_U }}
+          password: ${{ secrets.VPS_DMC268_P }}
+          script: |
+            NAME="dmc-ui-${{ needs.build-and-push.outputs.suffix }}"
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+            if docker inspect "${NAME}-prev" >/dev/null 2>&1; then
+              docker rename "${NAME}-prev" "$NAME" && docker start "$NAME"
+            else
+              echo "Предыдущей версии нет, откатываться некуда."
+            fi
+            docker ps --filter name=dmc-ui
