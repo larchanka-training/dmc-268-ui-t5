@@ -5,7 +5,15 @@
 | Проект | DMC-268 UI, команда 5 |
 | Статус | Черновик для командного утверждения; решения и стартовые SLO требуют валидации |
 | Область | MVP: веб-интерфейс, API, асинхронный анализ изменений, GitHub/GitLab и LLM gateway |
-| Источник требований | `main.md`; продуктовые параметры, не определённые в задании, перечислены в разделе «Открытые решения» |
+| Источник требований | [`../main.md`](../main.md); продуктовые параметры, не определённые в задании, перечислены в разделе «Нерешённые вопросы» |
+
+## Краткое резюме
+
+Строим AI-ревьюера для Pull Request и Merge Request. Backend принимает подписанные события и команды UI, сохраняет проверку в PostgreSQL и передаёт задачу в RabbitMQ через outbox. Worker получает diff и ограниченный контекст, вызывает LLM через gateway, валидирует ответ и сохраняет findings. Отдельный worker публикует только одобренные результаты в GitHub или GitLab с идемпотентностью и ограничением скорости.
+
+Web UI остаётся клиентом backend API: он показывает список review, diff, findings и статус публикации, но не вызывает VCS напрямую. Для MVP выбираем RabbitMQ с собственным consumer, Ollama с явно заданным контекстом и публикацию `draft_only` по умолчанию. Большой diff обрабатывается ограниченным числом параллельных частей в общем бюджете времени; детали приведены в разделе 12.
+
+Ключевые решения, которые ещё требуют владельца и срока, собраны в разделе «Нерешённые вопросы». Термины вынесены в глоссарий, а подробные JSON-контракты -- в приложение.
 
 ## 1. Цель и границы
 
@@ -17,32 +25,50 @@
 
 Вне MVP, пока команда не согласовала обратное: обучение собственной foundation model, индексирование всего репозитория, полноценный IDE-плагин, гарантии точности модели и автоматическое блокирование merge по результату LLM.
 
-## 2. Контейнерная архитектура (C4, уровень контейнеров)
+## 2. Архитектура
+
+### C4 Level 1: System Context
+
+```mermaid
+flowchart LR
+  Dev[Разработчик и ревьюер]
+  Admin[Администратор tenant]
+  System[AI Code Reviewer]
+  VCS[GitHub или GitLab]
+  Ollama[Локальный Ollama]
+
+  Dev -->|запускает review, просматривает diff и findings| System
+  Admin -->|настраивает installation, policy и доступы| System
+  VCS -->|webhook: PR/MR и комментарии| System
+  System -->|читает изменения, публикует review| VCS
+  System -->|ограниченный контекст и запрос анализа| Ollama
+```
+
+### C4 Level 2: контейнеры
 
 ```mermaid
 flowchart LR
     Dev[Разработчик]
     VCS[GitHub или GitLab]
-    UI[Web UI\nReact + TypeScript]
-    API[Backend API\nFastAPI]
-    DB[(PostgreSQL\nсостояние и аудит)]
+    UI[Web UI<br/>React + TypeScript]
+    API[Backend API<br/>FastAPI]
+    DB[(PostgreSQL<br/>состояние и аудит)]
     Outbox[Outbox publisher]
-    MQ[[RabbitMQ\nreview + publish jobs]]
-    Worker[Workers\nreview + publication handlers]
-    Cache[(Опциональный Redis\nкэш / rate limits)]
-    Gateway[LLM Gateway\nполитики + адаптеры]
-    LLM[Одобренный LLM provider\nOllama для локального пути MVP]
+    MQ[[RabbitMQ<br/>review + publish jobs]]
+    Worker[Workers<br/>review + publication handlers<br/>LLM Gateway library]
+    Cache[(Опциональный Redis<br/>кэш / rate limits)]
+    LLM[Одобренный LLM provider<br/>Ollama для локального пути MVP]
 
     Dev -->|просмотр, запуск, решение по finding| UI
     UI -->|HTTPS: API| API
     VCS -->|подписанный webhook| API
     API -->|записи, транзакции, outbox| DB
+    DB -->|читает неподтверждённый outbox| Outbox
     Outbox -->|версионированная задача| MQ
     MQ -->|at-least-once доставка| Worker
     Worker -->|чтение/запись статуса и результата| DB
     Worker -.->|опциональный cache-aside| Cache
-    Worker -->|контракт анализа без VCS-секретов| Gateway
-    Gateway -->|ограниченный запрос по политике данных| LLM
+    Worker -->|gateway contract; ограниченный запрос без VCS-секретов| LLM
     Worker -->|готовые результаты через адаптер| VCS
 ```
 
@@ -54,11 +80,11 @@ Backend API и consumers могут быть одним Python-пакетом и
 flowchart TB
     subgraph Backend[Backend: FastAPI и worker]
       Webhooks[Webhook/API adapters]
-      App[Application services\nReview lifecycle]
-      VCSPorts[VCS ports\nGitHub / GitLab]
+      App[Application services<br/>Review lifecycle and orchestration]
+      VCSPorts[VCS ports<br/>GitHub / GitLab]
       Builder[Context Builder]
       LLMPort[LLM Gateway port]
-      Validator[Finding validator\ncoordinates + schema + dedupe]
+      Validator[Finding validator<br/>coordinates + schema + dedupe]
       Repos[Repositories]
       Publisher[Outbox / queue publisher]
     end
@@ -68,10 +94,11 @@ flowchart TB
     App --> Publisher
     App --> Builder
     Builder --> VCSPorts
-    Builder --> LLMPort
-    LLMPort --> Validator
+    App --> LLMPort
+    LLMPort --> App
+    App --> Validator
     Validator --> Repos
-    Validator --> VCSPorts
+    App --> VCSPorts
 ```
 
 | Компонент | Ответственность | Не отвечает за |
@@ -87,12 +114,28 @@ flowchart TB
 
 ## 3. Поток данных
 
+### Упрощённый поток
+
+```mermaid
+flowchart LR
+  A[PR/MR или запуск из UI] --> B[Backend сохраняет review]
+  B --> C[Очередь и worker]
+  C --> D[Diff и контекст]
+  D --> E[LLM анализ]
+  E --> F[Проверка findings]
+  F --> G[UI: draft findings]
+  G --> H[Одобренная публикация в VCS]
+```
+
+Ниже приведена подробная последовательность с транзакциями, очередью и обработкой повторов.
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant VCS as GitHub/GitLab
     participant API as Backend API
     participant DB as PostgreSQL
+    participant O as Outbox publisher
     participant Q as RabbitMQ
     participant W as Review worker
     participant P as Publication worker
@@ -104,7 +147,8 @@ sequenceDiagram
     API->>API: Проверить подпись, installation и событие
     API->>DB: Транзакция: dedupe delivery, создать ReviewJob + Outbox
     API-->>VCS: 2xx после durable commit
-    DB-->>Q: Outbox publisher отправляет ReviewRequested.v1
+    O->>DB: Читает неподтверждённый outbox
+    O->>Q: Отправляет ReviewRequested.v1
     Q->>W: Доставка задачи (at-least-once)
     W->>DB: Claim job / записать попытку
     W->>C: Собрать diff и ограниченный контекст для base/head SHA
@@ -124,7 +168,8 @@ sequenceDiagram
       end
     end
     opt PublicationOperation создана
-      DB-->>Q: PublishArtifact.v1
+      O->>DB: Читает PublicationOperation outbox
+      O->>Q: Отправляет PublishArtifact.v1
       Q->>P: Доставка publication operation
       P->>DB: Захватить operation (lease/CAS)
       P->>VCS: Найти публикацию с тем же marker
@@ -150,6 +195,9 @@ sequenceDiagram
 
 Основные сущности:
 
+- `Tenant`: изолированная организация, её policy и retention settings. Все записи review, cache namespace и installation принадлежат одному tenant.
+- `User`: пользователь tenant с внешним identity subject; доступ проверяется для каждого API-запроса.
+- `RoleBinding`: роль `tenant_admin`, `reviewer` или `viewer` на tenant/repository с явным набором разрешений.
 - `Installation`: провайдер, внешний installation/project ID, зашифрованная ссылка на секрет, разрешённые репозитории.
 - `Review`: provider, repository, PR/MR ID, base SHA, head SHA, инициатор, policy snapshot, статус и временные метки.
 - `ReviewJob`: review ID, `kind` (`full`/`follow_up`), idempotency key, состояние, номер попытки, lease/heartbeat, последняя ошибка; follow-up дополнительно хранит `parent_review_id` и source comment/thread ID.
@@ -163,7 +211,7 @@ sequenceDiagram
 ## 5. VCS: взаимодействие и контракты
 
 1. Поддерживать GitHub и GitLab за единым внутренним контрактом `VCSAdapter`; платформенные имена событий, quick actions, форматы координат и синтаксис suggestion не протекают в UI или доменные сервисы.
-2. Нормализовать открытие/обновление PR/MR, UI/API запуск, команды, mentions и ответы в review thread в типизированные события. Проверять подпись webhook до обработки тела как команды, installation/project permissions и допустимость действия. Секреты webhook различаются по installation/project.
+2. Нормализовать открытие/обновление PR/MR, UI/API запуск, команды, mentions и ответы в review thread в типизированные события. До проверки подписи backend находит installation по provider installation ID, repository ID или webhook endpoint configuration, затем извлекает только её secret. Неизвестный repository или неверная подпись получают `401/404` без создания review.
 3. Дедуплицировать webhook по provider + delivery ID, comment-trigger по provider comment ID, ручной запуск по idempotency key из repo, PR/MR, head SHA и request identity. Ответ в треде должен ссылаться на исходные review/finding/thread и проходить авторизацию автора.
 4. Review привязан к неизменяемым `base_sha` и `head_sha`. Diff и содержимое файлов получать именно для них; перед публикацией сверять актуальный head. Если head изменился, пометить старую задачу `stale`, не публиковать её результат и, если включён automatic-update trigger, создать/дедуплицировать новый ReviewJob для нового SHA. Завершить старую задачу как stale без обработки нового события недостаточно.
 5. Внутреннее finding хранит `path`, `old_line?`, `new_line?`, диапазон, сторону и SHA. Adapter преобразует их в GitHub diff position / GitLab discussion position; mapping покрывается контрактными тестами. Нельзя подменять diff position абсолютным номером строки.
@@ -191,11 +239,202 @@ Exactly-once между PostgreSQL и внешним VCS API недостижи�
 
 ### Рекомендация
 
-Для первого надёжного контура использовать RabbitMQ как транспорт, PostgreSQL как источник истины и небольшой адаптер очереди в backend. Прямой consumer достаточен для MVP. Celery допустим, если команда выберет его ради готовых Python worker/retry-инструментов, но состояние review и гарантии идемпотентности всё равно остаются явными в PostgreSQL. Не запускать Redis Streams как вторую очередь параллельно RabbitMQ без отдельной причины и модели восстановления.
+Для первого надёжного контура использовать RabbitMQ как транспорт, PostgreSQL как источник истины и небольшой adapter очереди в backend. Прямой consumer достаточен для MVP. Не запускать Redis Streams как вторую очередь параллельно RabbitMQ без отдельной причины и модели восстановления.
+
+| Вариант | Плюсы | Ограничения | Решение MVP |
+|---|---|---|---|
+| RabbitMQ + свой consumer | Прозрачные ack, prefetch, DLQ и схема сообщений; lifecycle/lease остаются в доменном коде | Нужно явно реализовать retry, tracing и worker bootstrap | Выбран: меньше скрытых retry и проще доказать идемпотентность |
+| Celery + RabbitMQ | Готовые task/retry primitives и Python-экосистема | Семантика retry и result backend может скрыть доменные переходы; всё равно нужен outbox и PostgreSQL lease/CAS | Не выбран для MVP; допустим позже при сохранении текущих message contracts |
 
 ### Сообщение `ReviewRequested.v1`
 
-Сообщение содержит ссылки и версии, а не исходный код или секреты:
+Сообщение содержит ссылки и версии, а не исходный код или секреты. Полный пример приведён в приложении A.1.
+
+- Delivery semantics: at-least-once; обработчик обязан быть идемпотентным.
+- Создание job и outbox выполняется в одной DB-транзакции; отдельный publisher отправляет неподтверждённые outbox события. Это закрывает окно потери между commit PostgreSQL и publish в брокер.
+- Consumer подтверждает сообщение после сохранения результата/терминального перехода. На временной ошибке — ограниченный retry с exponential backoff + jitter; после лимита — DLQ с alert и возможностью контролируемого replay.
+- Ошибка схемы/неподдерживаемый event version не должна бесконечно повторяться: quarantine/DLQ и диагностика.
+- Ограничить prefetch/число параллельных вызовов по лимитам VCS и LLM. Heartbeat/lease позволяет обнаружить зависший worker; повтор не создаёт второго активного job для того же idempotency key.
+- Запрещено помещать исходный код, prompt, токены или PII в заголовки/логи сообщений.
+
+### Сообщение `PublishArtifact.v1`
+
+Сообщение содержит ссылку на уже сохранённую операцию, а не тело комментария или секреты. `operation_id` и `idempotency_key` указывают на одну и ту же логическую публикацию при всех повторных доставках; полный пример приведён в приложении A.2.
+
+## 7. Стратегия кэширования контекста
+
+Начать с cache-aside и выключаемого Redis-адаптера. Кэш — оптимизация, не источник истины. На первом этапе разрешить кэшировать результаты получения immutable diff/file content только при подтверждённых правах и политике хранения. Не кэшировать ответы LLM без измеримой выгоды и стратегии инвалидирования.
+
+Кэшировать отдельные immutable-объекты, а не готовый prompt. Это позволяет повторно использовать содержимое одного blob в разных PR и не сбрасывать его после изменения описания MR.
+
+| Namespace | Ключ | Данные |
+|---|---|---|
+| `diff` | `provider | repository_id | base_sha | head_sha | diff_format_version` | нормализованный diff и manifest неполноты |
+| `file` | `provider | repository_id | blob_sha | redaction_policy_version` | текст одного разрешённого файла |
+| `ast` | `provider | repository_id | blob_sha | parser_version | grammar_version` | symbols, imports и parse diagnostics |
+| `review-feedback` | `tenant_id | review_id | feedback_snapshot_id` | краткий snapshot существующих комментариев |
+
+`ReviewIntent`, правила проекта и feedback добавляются при сборке `ContextBundle`, но не входят в ключи `diff`, `file` или `ast`.
+
+Правила:
+
+- Разделять namespace между tenant/installation; проверять разрешения до cache hit, чтобы кэш не обходил авторизацию.
+- Изменение SHA, blob SHA, parser/redaction version формирует новый ключ immutable-объекта; явная инвалидизация при новом commit не нужна. Изменение MR metadata, правил или feedback меняет только новый ContextBundle.
+- Хранить только необходимое, шифровать в покое и ограничивать TTL. Стартовое предложение для временного кэша контента: максимум 24 часа; значение требует одобрения retention-политики.
+- Поддержать удаление по tenant/repository и запрет кэширования для репозиториев с более строгой политикой.
+- Redis, если включён, используется для короткоживущих кэш-записей, rate limits и distributed locks с TTL. Очередь остаётся RabbitMQ. При недоступности кэша система продолжает работу с деградацией производительности.
+- До утверждения требований к размещению/удалению данных не сохранять целые файлы в постоянном хранилище и не отправлять их неутверждённому hosted LLM.
+
+## 8. Context Builder: четыре уровня
+
+Контракт верхнего уровня `ContextBundle` версионируется и включает `review_id`, provider/repository/MR IDs, base/head SHA, язык, режим redaction, лимит токенов, список chunks, manifest и `feedback_snapshot_id`. Отдельный `ReviewIntent` содержит title, description, labels и выбранные commit messages; `ProjectRules` — нормализованные правила и digest/version; `ExistingFeedback` — ограниченный snapshot релевантных review comments/discussions с provider IDs, путями, line ranges и состоянием. `review_metadata_digest` и `feedback_snapshot_id` меняются при обновлении title/description/labels/commit messages или доступных комментариев, даже если head SHA не изменился. Метаданные и feedback передаются как недоверенные данные, не как системные инструкции. Каждый элемент контекста содержит источник, путь, диапазон строк, SHA содержимого, encoding/language и число оценочных токенов. Контент передаётся модели только после проверки прав, фильтрации секретов/исключённых путей и бюджета.
+
+| Уровень | Данные | Когда включать |
+|---|---|---|
+| 1. Diff | Для каждого файла: `path`, `change_type`, `base_sha`, `head_sha`, unified hunks, context/add/delete строки с `old_line`/`new_line`, изменённые диапазоны, язык. Исключать бинарные/сгенерированные файлы и пути из нормализованных repository ignore rules | Всегда; основной предмет ревью |
+| 2. Surrounding | Ограниченные окна до/после изменённых диапазонов из head-файла, при необходимости base-версии для удалённых строк; точные start/end lines, связь с hunk, причина включения. Добавлять содержащую функцию/класс, если парсер определил её и бюджет позволяет | Начальное окно: 30 строк с каждой стороны; адаптивно расширять до 100 строк или до границ содержащего symbol, только в пределах бюджета |
+| 3. Whole File | Полное содержимое небольшого изменённого текстового файла head-версии с номерами строк и маской изменённых диапазонов; для удаления — base-версия с явным указанием стороны | Не более 400 строк и 24kB после redaction; иначе использовать Surrounding |
+| 4. AST / Imports | Изменённые symbol IDs/имена, kind, signature, диапазон определения; import edges и ограниченные определения непосредственно используемых символов; язык/версия parser/грамматики и confidence | Не более одного import hop от изменённого symbol и до 10 определений; только если локальные уровни не объясняют тип/контракт. Tree-sitter даёт синтаксическую структуру, но не заменяет type checker/семантический индекс |
+
+Сборщик работает в порядке `Diff -> Surrounding -> Whole File -> AST/Imports`, но решение об уровнях зависит от бюджета и достаточности локального контекста. В MVP предпочтительны выборочные импорты/определения, а не индекс всего репозитория. Ignore rules нормализуются из платформенной конфигурации и правил репозитория (например, `.gitlab/duo-ignore` только как вход адаптера, а не внутренний формат); конфликт правил разрешается по явно заданной precedence и отражается в manifest. Все части сохраняют происхождение и координаты; нельзя смешивать строки base/head без явного `side`. Для большого diff разбивать по файлам и hunks, приоритизировать исходный код над generated/docs/config, однако не терять неизменённые файлы молча: записывать причину skip/truncation в manifest.
+
+### Структуры одного элемента
+
+Полный пример `ContextBundle` вынесен в приложение A.3. Он иллюстрирует форму данных, а не окончательный публичный API. Реальный `ContextBundle` должен использовать строгую schema validation и не включать отсутствующие уровни как пустые строки.
+
+## 9. LLM Gateway и проверка результата
+
+Перед вызовом gateway backend проверяет права installation/repository, выбранную модель и data policy. Провайдерный контракт описывает фактические retention/training capabilities; ZDR нельзя считать обеспеченным только наличием request flag. Если требуемая политика не подтверждена провайдером, запрос не отправляется.
+
+LLM Gateway -- библиотека внутри backend/worker package, а не отдельный deployable-сервис MVP. Она принимает версионированный запрос с `review_id`, `chunk_id`, prompt version, ограниченным ContextBundle и лимитами. Prompt assembly включает diff positions, ReviewIntent и разрешённые ProjectRules, но явно маркирует их как недоверенные данные. Анализ фокусируется на security, correctness, performance и maintainability; style-only findings подавляются, если репозиторий делегирует их линтеру. Эти категории -- политика анализа, не гарантия обнаружения всех дефектов.
+
+Локальная конфигурация MVP фиксируется как `qwen2.5-coder:14b` в Ollama, `num_ctx=32768`, `num_predict=4096`, `temperature=0.1`. Перед rollout image digest загруженной модели фиксируется в deployment configuration. Backend передаёт `num_ctx` в каждом запросе и на startup сверяет tag и digest. Если хост не вмещает эту модель или контекст, review не деградирует молча: установка помечается unavailable, а оператор выбирает подтверждённую меньшую конфигурацию и пересчитывает лимиты раздела 12.
+
+Ответ модели парсится по JSON schema, содержащей список findings. Минимальные поля finding: `path`, `side`, `start_line`, `end_line`, `severity`, `category`, `title`, `body`; `suggestion` (`replacement` + целевой диапазон) и `confidence` опциональны. Для каждого finding требуется короткое evidence/reasoning, grounded в переданном контексте; confidence не используется как доказательство корректности.
+
+Перед записью/публикацией validator проверяет:
+
+- schema и допустимые enum значения;
+- что путь есть в проверяемом изменении, диапазон существует в base/head snapshot и comment привязан к допустимой стороне diff;
+- что finding относится к изменённой строке, если политика публикации требует inline-комментарий;
+- лимит длины, отсутствие секретов в сообщении, дубли по нормализованному fingerprint и уже существующим комментариям;
+- что head SHA всё ещё актуален перед отправкой в VCS.
+
+Ошибки schema/координат отбрасываются или переводятся в диагностическое состояние; они не исправляются догадкой. LLM timeout/retry ограничены, prompt не содержит credential. Результаты имеют происхождение модели и prompt version. Начальный режим публикации предлагается `draft_only`; порог автопубликации и возможность блокировать merge требуют отдельного решения.
+
+## 10. Frontend и API
+
+Frontend (React + TypeScript) отвечает за рабочее место ревьюера: список файлов/hunks, стабильные old/new line numbers, inline findings/comments, фильтры severity/category/status и состояния loading/empty/error/partial. UI state и server state разделяются; API-клиент не знает платформенные детали GitHub/GitLab.
+
+Предлагаемые backend endpoints:
+
+- `POST /api/v1/reviews` — запросить проверку, требует auth/idempotency key, возвращает `202` + `review_id`.
+- `GET /api/v1/repositories/{repository_id}/reviews?pull_request_id=` — список review конкретного PR/MR с пагинацией.
+- `GET /api/v1/reviews/{review_id}` — состояние и прогресс.
+- `GET /api/v1/reviews/{review_id}/diff` — нормализованный diff, список файлов и manifest усечённых/недоступных частей; UI получает его только из backend.
+- `GET /api/v1/reviews/{review_id}/findings` — проверенные findings с фильтрами/пагинацией.
+- `PATCH /api/v1/findings/{finding_id}` — пользовательское решение (accepted, dismissed, resolved), с автором и аудитом.
+- `POST /api/v1/reviews/{review_id}/publish` — явное одобрение публикации выбранных findings в draft-only режиме; проверяет repository permissions/policy и транзакционно создаёт PublicationOperation + outbox, возвращает operation IDs и publication statuses.
+- `POST /api/v1/reviews/{review_id}/retry` — повтор для актуального head SHA с авторизацией и rate limit.
+- `POST /api/v1/reviews/{review_id}/cancel` — переводит только незавершённую проверку в `cancelled`, отзывает lease и помечает уже доставленные сообщения no-op; опубликованные артефакты не удаляет.
+- `POST /api/v1/reviews/{review_id}/follow-ups` — (если включён диалоговый режим) продолжение по разрешённому thread/finding context; не заменяет отдельный endpoint полного rerun.
+- `POST /api/v1/webhooks/{provider}` — webhook endpoint с provider-specific signature verification.
+
+Схемы API версионируются; ошибки стабильны (`code`, `message`, `trace_id`). Пользователь видит частичный результат и статус задачи; повторная отправка запроса не должна создавать дубликат review. Текущий UI использует mock-функции в `entities/*/api`; при интеграции они заменяются HTTP-клиентом в `shared/api`, при этом TanStack Query keys и Zustand UI-state сохраняются. `GET /reviews/{id}/diff` заменяет mock merge request, а findings/status -- mock review comments.
+
+## 11. Безопасность и приватность
+
+- Backend хранит VCS credentials в secret manager/зашифрованном хранилище; минимальные scopes, rotation и аудит. Frontend получает только короткоживущую пользовательскую сессию.
+- Проверять tenant/repository permissions на каждом API-запросе и до чтения кэша/результатов.
+- Исходный код считается чувствительными данными. Передача в hosted LLM запрещена без явного одобрения провайдера/политики хранения; локальный Ollama не отменяет сетевые и access controls.
+- TLS между компонентами, шифрование at rest, redaction secrets/PII, ограничение размера webhook/API, rate limits, защита от SSRF/подмены repository URL и вредоносных prompt-инструкций в коде.
+- Код в diff рассматривается как недоверенный ввод, не как системные инструкции. Не исполнять предложенный код и не разрешать модели инструменты с доступом к shell/repo в MVP.
+- Audit trail фиксирует инициатора, SHA, модель/prompt версии, переходы статуса, решение пользователя и публикацию без записи секретов или полного исходного кода.
+- Retention/deletion и data residency должны быть согласованы до production.
+
+## 12. Нефункциональные требования и стартовые лимиты
+
+Числа ниже — **предлагаемые начальные цели для нагрузочной проверки**, не утверждённые SLA. Все лимиты конфигурируются; фактический максимум контекста ограничен меньшим из системного лимита и лимита выбранной модели.
+
+| Метрика | Стартовая цель / лимит | Уточнение |
+|---|---|---|
+| Webhook acknowledgement | p95 <= 2 s после валидации и durable enqueue intent | Вебхук не ждёт LLM; очередь достигается через outbox |
+| API чтения статуса/findings | p95 <= 500 ms при обычной нагрузке MVP | Требует измерения на staging |
+| Context Builder | p95 <= 10 s для PR до 100 файлов и 5,000 изменённых строк | Исключая внешнюю задержку VCS; большие входы ограничиваются/разбиваются |
+| Завершение review | p95 <= 120 s от durable enqueue до `completed`/`completed_partial` для PR до 500 изменённых строк; hard timeout 300 s | Queue age измеряется отдельно; SLO проверяется на staging с зафиксированной моделью и concurrency |
+| Размер diff | Ingress: до 5 MiB patch. Анализ: до 1 MiB нормализованного patch, 100 файлов, 5,000 изменённых строк и 64k diff tokens | Ingress limit защищает API, но не обещает полный анализ. Превышение analysis limit даёт `completed_partial` с manifest либо `too_large`, если ни одна приоритетная часть не помещается |
+| Prompt/context | По умолчанию <= 32k input tokens на LLM-вызов; output reserve <= 4k; жёсткий cap = min(32k, provider limit - output reserve) | Большая проверка разбивается на chunks; токены считаются tokenizer выбранной модели или консервативной оценкой |
+| Chunking | До 2 частей для SLO-PR и до 4 частей для крупного review; до 16k diff tokens на часть | SLO-части запускаются одновременно; крупные части -- волнами с concurrency 2. Лишнее отражается в manifest |
+| Retry | Одна повторная попытка на временную ошибку; 35 s на вызов для SLO-PR, 45 s для крупного review | Не повторять schema errors; retry допускается только пока остаётся общий deadline |
+| VCS publication | Per installation/repository очередь: 1 запрос создания в секунду, burst 5; максимум 50 артефактов/review | Применяются provider headers и ограничения ниже; `429` или `Retry-After` приостанавливает key и переносит задачу |
+| Восстановление | Повторная доставка безопасна; job/outbox переживают рестарт API/worker | Проверять fault-injection тестами |
+| Доступность | Цель production пока не задана | Утвердить после выбора deployment и режима обслуживания |
+
+Общий budget одного review: до 120 секунд для SLO-PR и до 300 секунд для крупного review. В него входят получение VCS-данных, сборка контекста, LLM и запись результатов; ожидание очереди измеряется отдельно. Для SLO-PR допускаются максимум две части, запускаемые одновременно: 15 секунд на VCS и Context Builder, 35 секунд на первый вызов LLM, 35 секунд на один retry только неуспевшей части и 35 секунд на валидацию/сохранение. Для крупного review допускаются четыре части двумя волнами по 45 секунд, а остаток 210 секунд резервируется для VCS, сборки, retry и записи. Если часть не завершилась к общему deadline, она отмечается `timed_out`; review возвращает частичный результат, а не продолжает работу после лимита.
+
+Контекстный бюджет включает system/developer prompt; при 32k input tokens начальные ориентиры на один chunk: до 16k diff, 6k surrounding, 4k whole-file и 2k AST/import metadata, оставшееся -- метаданные и инструкции. Это верхние пределы, не квоты: Diff сохраняется приоритетом, расширенные уровни урезаются первыми. Diff больше 64k токенов, более 4 chunks или с нормализованным patch больше 1 MiB получает `completed_partial` с причиной для каждого пропуска; `too_large` возвращается, если нет ни одной анализируемой части. Предел 5 MiB остаётся ingress-защитой. VCS adapter записывает в manifest неполные file patches, которые некоторые GitHub/GitLab API возвращают для больших файлов; такие файлы не публикуются inline без полного подтверждённого диапазона.
+
+| Provider | Внешнее ограничение | Политика adapter |
+|---|---|---|
+| GitHub | Для аутентифицированного REST API учитывать primary limit `5,000` requests/hour, secondary point limit и content-creation limit `80`/minute и `500`/hour; фактические значения читать из `x-ratelimit-*` и `retry-after` | Token bucket не превышает 1 create/s; при остатке primary quota <= 100 или любом secondary limit отложить key до reset/retry time |
+| GitLab | Лимиты зависят от GitLab.com или self-managed instance; adapter читает `RateLimit-*`/`Retry-After`, а installation хранит утверждённые instance limits | До подтверждения instance policy действует 1 create/s; при отсутствии headers 429 считается обязательной паузой до retry time либо экспоненциального backoff |
+
+Publication worker применяет token bucket к installation/repository, читает `Retry-After` и provider rate-limit headers, а 429 ставит в delayed queue до разрешённого времени. При 5xx/timeout действует reconciliation из раздела 5; при переполнении лимита 50 артефактов findings остаются в UI как draft, а итоговая summary сообщает о непубликованных результатах.
+
+Обязательные метрики: webhook acceptance/invalid signatures, queue age/depth, job duration/status, context tokens по уровням, доля skip/truncation, VCS/LLM latency/errors/rate limits, schema/coordinate rejection, findings published/dismissed и стоимость на review. Логи структурированные с `trace_id`/`review_id`; исходный код и prompt body в логи не включаются.
+
+## 13. Проверка качества
+
+- Unit: diff parser, вычисление line mapping, фильтры путей, budget/chunking, fingerprint/dedup, state transitions.
+- Contract: VCS event/API adapters, queue schema version, LLM JSON schema, GitHub/GitLab coordinates.
+- Integration: PostgreSQL + RabbitMQ outbox/retry/DLQ, mock LLM, mock VCS; публикация проверяется при конкурентной доставке, падении до/после remote create, timeout после принятия запроса, задержанной видимости marker, частичном успехе и провайдере без надёжной reconciliation. Для ambiguous outcome тест подтверждает отсутствие слепого повторного create.
+- E2E: webhook/on-demand -> review -> UI -> решение пользователя -> (если включено) публикация; сценарий stale head и duplicate delivery.
+- LLM evaluation: versioned golden dataset, precision/recall по security/correctness/performance/maintainability, false-positive rate и координатная корректность; отдельно тестировать ignore rules, MR rules/metadata, существующие comments, suggestions и follow-up thread scope. Не считать self-review/judge без human-calibrated dataset доказательством true positive.
+- Security: tenant isolation, webhook signature, secret redaction, authorization, prompt injection, retention/deletion.
+
+## 14. Нерешённые вопросы
+
+Все пункты ниже требуют решения до перехода соответствующей возможности в production. Владелец отвечает за фиксацию решения в policy/configuration, а не только за обсуждение.
+
+| Вопрос | Владелец | Срок | Что блокирует |
+|---|---|---|---|
+| Формула `fingerprint`: какие нормализованные поля finding входят, как учитывать изменение диапазона/текста | Tech Lead + Backend Lead | 2026-10-30 | dedupe и idempotency key inline-публикации |
+| Поведение findings при новом head SHA: закрывать, переносить или показывать как устаревшие | Product Owner + Tech Lead | 2026-11-06 | UX статуса stale и auto-publish |
+| Debounce частых push и отмена активного review | Tech Lead | 2026-10-30 | защита от очереди устаревших review |
+| Предотвращение trigger loop: bot comments не активируют mention/thread-reply | VCS Adapter owner | 2026-11-06 | безопасное включение диалога с ботом |
+| Обязательные GitHub/GitLab adapters первого релиза | Product Owner | 2026-10-30 | план поставки и contract tests |
+| Identity provider, роли и граница tenant/repository | Security Lead | 2026-11-06 | API authorization и tenant isolation |
+| Retention, deletion, data residency и допустимые hosted LLM | Security/Legal owner | 2026-11-13 | выбор provider и cache TTL |
+| Нагрузка, SLO, стоимость и производительность выбранного Ollama host | Platform Lead | 2026-11-13 | утверждение лимитов раздела 12 |
+| Языки MVP, parser и точная глубина semantic index | Tech Lead | 2026-11-06 | AST/import level beyond Tree-sitter |
+| Условия auto-publish и merge gate | Product Owner + Security Lead | 2026-11-20 | включение публикации вне `draft_only` |
+
+До решения debounce действует стартовая политика: на `(tenant_id, provider, repository_id, pull_request_id)` существует один pending debounce record. Каждый новый push заменяет в нём `head_sha`, переносит `run_after` на 30 секунд и запрашивает cancellation предыдущего queued/collecting/analyzing job. Когда `run_after` наступает, publisher создаёт ровно один ReviewJob для последнего SHA; delivery с более старым SHA становится no-op. События от bot identity и comments с provider marker игнорируются как trigger. Это временная защита, не заменяющая решение владельца.
+
+## 15. Глоссарий
+
+| Термин | Значение |
+|---|---|
+| Outbox | Таблица событий, записываемая в одной транзакции с бизнес-состоянием и позже доставляемая publisher в брокер. |
+| Lease/CAS | Временная аренда работы и compare-and-set переход состояния; не позволяет двум worker одновременно владеть одной операцией. |
+| Reconciliation | Проверка внешнего VCS, был ли артефакт создан, прежде чем повторять сомнительный сетевой вызов. |
+| DLQ | Dead-letter queue для сообщений, которые исчерпали допустимые попытки и требуют диагностики/replay. |
+| Stale | Результат относится к неактуальному head SHA и не может быть опубликован. |
+| Fingerprint | Стабильный идентификатор смысла finding; его формула пока является открытым решением. |
+
+## 16. Критерии готовности системного дизайна
+
+- [x] Описаны C4 Level 1 и контейнеры/компоненты, потоки данных и границы frontend/backend/LLM/VCS.
+- [x] Определены рекомендуемая очередь, версия сообщения, retry/idempotency и стратегия кэширования.
+- [x] Описаны payload-структуры для Diff, Surrounding, Whole File и AST/Imports.
+- [x] Заданы стартовые проверяемые latency/context limits и отмечено, что они требуют валидации.
+- [ ] Подтверждены GitHub renderer для Mermaid-диаграмм и Ollama model tag/`num_ctx` на целевом host.
+- [ ] Команда подтвердила открытые решения и начальные SLO.
+- [ ] Команда утвердила документ; до этого статус остаётся «Черновик для командного утверждения».
+
+## Приложение A: примеры контрактов
+
+### A.1 `ReviewRequested.v1`
 
 ```json
 {
@@ -221,16 +460,7 @@ Exactly-once между PostgreSQL и внешним VCS API недостижи�
 }
 ```
 
-- Delivery semantics: at-least-once; обработчик обязан быть идемпотентным.
-- Создание job и outbox выполняется в одной DB-транзакции; отдельный publisher отправляет неподтверждённые outbox события. Это закрывает окно потери между commit PostgreSQL и publish в брокер.
-- Consumer подтверждает сообщение после сохранения результата/терминального перехода. На временной ошибке — ограниченный retry с exponential backoff + jitter; после лимита — DLQ с alert и возможностью контролируемого replay.
-- Ошибка схемы/неподдерживаемый event version не должна бесконечно повторяться: quarantine/DLQ и диагностика.
-- Ограничить prefetch/число параллельных вызовов по лимитам VCS и LLM. Heartbeat/lease позволяет обнаружить зависший worker; повтор не создаёт второго активного job для того же idempotency key.
-- Запрещено помещать исходный код, prompt, токены или PII в заголовки/логи сообщений.
-
-### Сообщение `PublishArtifact.v1`
-
-Сообщение содержит ссылку на уже сохранённую операцию, а не тело комментария или секреты. `operation_id` и `idempotency_key` указывают на одну и ту же логическую публикацию при всех повторных доставках:
+### A.2 `PublishArtifact.v1`
 
 ```json
 {
@@ -246,201 +476,16 @@ Exactly-once между PostgreSQL и внешним VCS API недостижи�
 }
 ```
 
-## 7. Стратегия кэширования контекста
-
-Начать с cache-aside и выключаемого Redis-адаптера. Кэш — оптимизация, не источник истины. На первом этапе разрешить кэшировать результаты получения immutable diff/file content только при подтверждённых правах и политике хранения. Не кэшировать ответы LLM без измеримой выгоды и стратегии инвалидирования.
-
-Ключ кэша вычислять как хеш канонической структуры:
-
-`tenant_id | provider | repository_id | base_sha | head_sha | path | context_policy_version | parser_version | project_rules_digest | review_metadata_digest | feedback_snapshot_id`
-
-Правила:
-
-- Разделять namespace между tenant/installation; проверять разрешения до cache hit, чтобы кэш не обходил авторизацию.
-- Изменение SHA, версии сборщика/parser/policy, правил репозитория, MR metadata или снимка существующих комментариев формирует новый ключ; для неизменяемых объектов явная инвалидизация при новом commit не нужна.
-- Хранить только необходимое, шифровать в покое и ограничивать TTL. Стартовое предложение для временного кэша контента: максимум 24 часа; значение требует одобрения retention-политики.
-- Поддержать удаление по tenant/repository и запрет кэширования для репозиториев с более строгой политикой.
-- Redis, если включён, используется для короткоживущих кэш-записей, rate limits и distributed locks с TTL. Очередь остаётся RabbitMQ. При недоступности кэша система продолжает работу с деградацией производительности.
-- До утверждения требований к размещению/удалению данных не сохранять целые файлы в постоянном хранилище и не отправлять их неутверждённому hosted LLM.
-
-## 8. Context Builder: четыре уровня
-
-Контракт верхнего уровня `ContextBundle` версионируется и включает `review_id`, provider/repository/MR IDs, base/head SHA, язык, режим redaction, лимит токенов, список chunks, manifest и `feedback_snapshot_id`. Отдельный `ReviewIntent` содержит title, description, labels и выбранные commit messages; `ProjectRules` — нормализованные правила и digest/version; `ExistingFeedback` — ограниченный snapshot релевантных review comments/discussions с provider IDs, путями, line ranges и состоянием. `review_metadata_digest` и `feedback_snapshot_id` меняются при обновлении title/description/labels/commit messages или доступных комментариев, даже если head SHA не изменился. Метаданные и feedback передаются как недоверенные данные, не как системные инструкции. Каждый элемент контекста содержит источник, путь, диапазон строк, SHA содержимого, encoding/language и число оценочных токенов. Контент передаётся модели только после проверки прав, фильтрации секретов/исключённых путей и бюджета.
-
-| Уровень | Данные | Когда включать |
-|---|---|---|
-| 1. Diff | Для каждого файла: `path`, `change_type`, `base_sha`, `head_sha`, unified hunks, context/add/delete строки с `old_line`/`new_line`, изменённые диапазоны, язык. Исключать бинарные/сгенерированные файлы и пути из нормализованных repository ignore rules | Всегда; основной предмет ревью |
-| 2. Surrounding | Ограниченные окна до/после изменённых диапазонов из head-файла, при необходимости base-версии для удалённых строк; точные start/end lines, связь с hunk, причина включения. Добавлять содержащую функцию/класс, если парсер определил её и бюджет позволяет | Начальное окно: 30 строк с каждой стороны; адаптивно расширять до 100 строк или до границ содержащего symbol, только в пределах бюджета |
-| 3. Whole File | Полное содержимое небольшого изменённого текстового файла head-версии с номерами строк и маской изменённых диапазонов; для удаления — base-версия с явным указанием стороны | Только если файл мал и целиком полезен; не включать автоматически крупные файлы |
-| 4. AST / Imports | Изменённые symbol IDs/имена, kind, signature, диапазон определения; import edges и ограниченные определения непосредственно используемых символов; язык/версия parser/грамматики и confidence | Выборочно, если локальные уровни не объясняют тип/контракт. Tree-sitter даёт синтаксическую структуру, но не заменяет type checker/семантический индекс |
-
-Сборщик работает в порядке `Diff -> Surrounding -> Whole File -> AST/Imports`, но решение об уровнях зависит от бюджета и достаточности локального контекста. В MVP предпочтительны выборочные импорты/определения, а не индекс всего репозитория. Ignore rules нормализуются из платформенной конфигурации и правил репозитория (например, `.gitlab/duo-ignore` только как вход адаптера, а не внутренний формат); конфликт правил разрешается по явно заданной precedence и отражается в manifest. Все части сохраняют происхождение и координаты; нельзя смешивать строки base/head без явного `side`. Для большого diff разбивать по файлам и hunks, приоритизировать исходный код над generated/docs/config, однако не терять неизменённые файлы молча: записывать причину skip/truncation в manifest.
-
-### Структуры одного элемента
+### A.3 `ContextBundle` fragment
 
 ```json
 {
-  "diff_file": {
-    "path": "src/service.ts",
-    "change_type": "modified",
-    "base_sha": "...",
-    "head_sha": "...",
-    "hunks": [{
-      "header": "@@ -10,2 +10,3 @@",
-      "lines": [
-        {"kind": "context", "old_line": 10, "new_line": 10, "text": "..."},
-        {"kind": "add", "new_line": 11, "text": "..."}
-      ]
-    }]
-  },
-  "review_intent": {
-    "title": "...",
-    "description": "...",
-    "labels": ["bug"],
-    "commit_messages": ["..."],
-    "metadata_digest": "..."
-  },
-  "project_rules": {
-    "rules_version": "...",
-    "rules_digest": "...",
-    "source": "repository-policy",
-    "rules": ["..."],
-    "ignore_patterns": ["generated/**"]
-  },
-  "existing_feedback": [{
-    "provider_comment_id": "...",
-    "thread_id": "...",
-    "path": "src/service.ts",
-    "side": "head",
-    "start_line": 11,
-    "end_line": 11,
-    "status": "unresolved",
-    "body": "..."
-  }],
-  "surrounding_window": {
-    "path": "src/service.ts",
-    "side": "head",
-    "start_line": 6,
-    "end_line": 18,
-    "for_hunk": 0,
-    "text": "..."
-  },
-  "whole_file": {
-    "path": "src/service.ts",
-    "side": "head",
-    "content_sha256": "...",
-    "changed_ranges": [[11, 11]],
-    "text": "..."
-  },
-  "symbol_context": {
-    "parser": "tree-sitter",
-    "parser_version": "...",
-    "symbols": [{"name": "loadUser", "kind": "function", "path": "src/service.ts", "start_line": 8, "end_line": 20, "signature": "..."}],
-    "imports": [{"from": "src/service.ts", "to": "src/user.ts", "symbols": ["User"]}]
-  }
+  "diff_file": {"path": "src/service.ts", "change_type": "modified", "base_sha": "...", "head_sha": "..."},
+  "review_intent": {"title": "...", "description": "...", "labels": ["bug"], "metadata_digest": "..."},
+  "project_rules": {"rules_version": "...", "rules_digest": "...", "ignore_patterns": ["generated/**"]},
+  "existing_feedback": [{"provider_comment_id": "...", "path": "src/service.ts", "side": "head", "start_line": 11}],
+  "surrounding_window": {"path": "src/service.ts", "side": "head", "start_line": 6, "end_line": 18},
+  "whole_file": {"path": "src/service.ts", "side": "head", "content_sha256": "...", "changed_ranges": [[11, 11]]},
+  "symbol_context": {"parser": "tree-sitter", "parser_version": "...", "symbols": ["..."], "imports": ["..."]}
 }
 ```
-
-Пример иллюстрирует форму данных, а не окончательный публичный API. Реальный `ContextBundle` должен использовать строгую schema validation и не включать отсутствующие уровни как пустые строки.
-
-## 9. LLM Gateway и проверка результата
-
-Перед вызовом gateway backend проверяет права installation/repository, выбранную модель и data policy. Провайдерный контракт описывает фактические retention/training capabilities; ZDR нельзя считать обеспеченным только наличием request flag. Если требуемая политика не подтверждена провайдером, запрос не отправляется.
-
-Gateway принимает версионированный запрос с `review_id`, `chunk_id`, prompt version, ограниченным ContextBundle и лимитами. Prompt assembly включает diff positions, ReviewIntent и разрешённые ProjectRules, но явно маркирует их как недоверенные данные. Анализ фокусируется на security, correctness, performance и maintainability; style-only findings подавляются, если репозиторий делегирует их линтеру. Эти категории — политика анализа, не гарантия обнаружения всех дефектов.
-
-Ответ модели парсится по JSON schema, содержащей список findings. Минимальные поля finding: `path`, `side`, `start_line`, `end_line`, `severity`, `category`, `title`, `body`; `suggestion` (`replacement` + целевой диапазон) и `confidence` опциональны. Для каждого finding требуется короткое evidence/reasoning, grounded в переданном контексте; confidence не используется как доказательство корректности.
-
-Перед записью/публикацией validator проверяет:
-
-- schema и допустимые enum значения;
-- что путь есть в проверяемом изменении, диапазон существует в base/head snapshot и comment привязан к допустимой стороне diff;
-- что finding относится к изменённой строке, если политика публикации требует inline-комментарий;
-- лимит длины, отсутствие секретов в сообщении, дубли по нормализованному fingerprint и уже существующим комментариям;
-- что head SHA всё ещё актуален перед отправкой в VCS.
-
-Ошибки schema/координат отбрасываются или переводятся в диагностическое состояние; они не исправляются догадкой. LLM timeout/retry ограничены, prompt не содержит credential. Результаты имеют происхождение модели и prompt version. Начальный режим публикации предлагается `draft_only`; порог автопубликации и возможность блокировать merge требуют отдельного решения.
-
-## 10. Frontend и API
-
-Frontend (React + TypeScript) отвечает за рабочее место ревьюера: список файлов/hunks, стабильные old/new line numbers, inline findings/comments, фильтры severity/category/status и состояния loading/empty/error/partial. UI state и server state разделяются; API-клиент не знает платформенные детали GitHub/GitLab.
-
-Предлагаемые backend endpoints:
-
-- `POST /api/v1/reviews` — запросить проверку, требует auth/idempotency key, возвращает `202` + `review_id`.
-- `GET /api/v1/reviews/{review_id}` — состояние и прогресс.
-- `GET /api/v1/reviews/{review_id}/findings` — проверенные findings с фильтрами/пагинацией.
-- `PATCH /api/v1/findings/{finding_id}` — пользовательское решение (accepted, dismissed, resolved), с автором и аудитом.
-- `POST /api/v1/reviews/{review_id}/publish` — явное одобрение публикации выбранных findings в draft-only режиме; проверяет repository permissions/policy и транзакционно создаёт PublicationOperation + outbox, возвращает operation IDs и publication statuses.
-- `POST /api/v1/reviews/{review_id}/retry` — повтор для актуального head SHA с авторизацией и rate limit.
-- `POST /api/v1/reviews/{review_id}/follow-ups` — (если включён диалоговый режим) продолжение по разрешённому thread/finding context; не заменяет отдельный endpoint полного rerun.
-- `POST /api/v1/webhooks/{provider}` — webhook endpoint с provider-specific signature verification.
-
-Схемы API версионируются; ошибки стабильны (`code`, `message`, `trace_id`). Пользователь видит частичный результат и статус задачи; повторная отправка запроса не должна создавать дубликат review.
-
-## 11. Безопасность и приватность
-
-- Backend хранит VCS credentials в secret manager/зашифрованном хранилище; минимальные scopes, rotation и аудит. Frontend получает только короткоживущую пользовательскую сессию.
-- Проверять tenant/repository permissions на каждом API-запросе и до чтения кэша/результатов.
-- Исходный код считается чувствительными данными. Передача в hosted LLM запрещена без явного одобрения провайдера/политики хранения; локальный Ollama не отменяет сетевые и access controls.
-- TLS между компонентами, шифрование at rest, redaction secrets/PII, ограничение размера webhook/API, rate limits, защита от SSRF/подмены repository URL и вредоносных prompt-инструкций в коде.
-- Код в diff рассматривается как недоверенный ввод, не как системные инструкции. Не исполнять предложенный код и не разрешать модели инструменты с доступом к shell/repo в MVP.
-- Audit trail фиксирует инициатора, SHA, модель/prompt версии, переходы статуса, решение пользователя и публикацию без записи секретов или полного исходного кода.
-- Retention/deletion и data residency должны быть согласованы до production.
-
-## 12. Нефункциональные требования и стартовые лимиты
-
-Числа ниже — **предлагаемые начальные цели для нагрузочной проверки**, не утверждённые SLA. Все лимиты конфигурируются; фактический максимум контекста ограничен меньшим из системного лимита и лимита выбранной модели.
-
-| Метрика | Стартовая цель / лимит | Уточнение |
-|---|---|---|
-| Webhook acknowledgement | p95 <= 2 s после валидации и durable enqueue intent | Вебхук не ждёт LLM; очередь достигается через outbox |
-| API чтения статуса/findings | p95 <= 500 ms при обычной нагрузке MVP | Требует измерения на staging |
-| Context Builder | p95 <= 10 s для PR до 100 файлов и 5,000 изменённых строк | Исключая внешнюю задержку VCS; большие входы ограничиваются/разбиваются |
-| Завершение review | p95 <= 120 s для PR до 500 изменённых строк; hard timeout 300 s | Зависит от модели; отдельно измерять очередь, VCS и LLM latency |
-| Размер diff | Стартовый максимум: 5 MiB patch, 100 файлов, 5,000 изменённых строк | Превышение: явный `too_large`/частичный результат, не тихая усечённая проверка |
-| Prompt/context | По умолчанию <= 32k input tokens на LLM-вызов; output reserve <= 4k; жёсткий cap = min(32k, provider limit - output reserve) | Большая проверка разбивается на chunks; токены считаются tokenizer выбранной модели или консервативной оценкой |
-| Retry | До 3 попыток на временную ошибку с backoff+jitter; provider timeout 60 s на вызов | Не повторять ошибку схемы бесконечно |
-| Восстановление | Повторная доставка безопасна; job/outbox переживают рестарт API/worker | Проверять fault-injection тестами |
-| Доступность | Цель production пока не задана | Утвердить после выбора deployment и режима обслуживания |
-
-Контекстный бюджет включает system/developer prompt; при 32k input tokens начальные ориентиры на один chunk: до 16k diff, 6k surrounding, 4k whole-file и 2k AST/import metadata, оставшееся — метаданные и инструкции. Это верхние пределы, не квоты: Diff сохраняется приоритетом, расширенные уровни урезаются первыми. Если diff сам не помещается, он дробится на логические chunks с устойчивыми ID и последующей дедупликацией.
-
-Обязательные метрики: webhook acceptance/invalid signatures, queue age/depth, job duration/status, context tokens по уровням, доля skip/truncation, VCS/LLM latency/errors/rate limits, schema/coordinate rejection, findings published/dismissed и стоимость на review. Логи структурированные с `trace_id`/`review_id`; исходный код и prompt body в логи не включаются.
-
-## 13. Проверка качества
-
-- Unit: diff parser, вычисление line mapping, фильтры путей, budget/chunking, fingerprint/dedup, state transitions.
-- Contract: VCS event/API adapters, queue schema version, LLM JSON schema, GitHub/GitLab coordinates.
-- Integration: PostgreSQL + RabbitMQ outbox/retry/DLQ, mock LLM, mock VCS; публикация проверяется при конкурентной доставке, падении до/после remote create, timeout после принятия запроса, задержанной видимости marker, частичном успехе и провайдере без надёжной reconciliation. Для ambiguous outcome тест подтверждает отсутствие слепого повторного create.
-- E2E: webhook/on-demand -> review -> UI -> решение пользователя -> (если включено) публикация; сценарий stale head и duplicate delivery.
-- LLM evaluation: versioned golden dataset, precision/recall по security/correctness/performance/maintainability, false-positive rate и координатная корректность; отдельно тестировать ignore rules, MR rules/metadata, существующие comments, suggestions и follow-up thread scope. Не считать self-review/judge без human-calibrated dataset доказательством true positive.
-- Security: tenant isolation, webhook signature, secret redaction, authorization, prompt injection, retention/deletion.
-
-## 14. Рекомендуемые решения и открытые решения
-
-| Тема | Рекомендация для MVP | Требует подтверждения |
-|---|---|---|
-| Backend shape | FastAPI API + отдельный worker из общего Python backend package | Да, включая границы новых backend репозиториев/сервисов |
-| Очередь | RabbitMQ + PostgreSQL outbox; прямой consumer | Да; Celery допустим при явных delivery/idempotency semantics |
-| Redis | Опционально: cache/rate limit/lock, не основная очередь | Да; включать только при измеримой потребности |
-| LLM | Ollama через заменяемый gateway; hosted providers только по политике | Да: локальная/hosted среда, модель, retention и data residency |
-| VCS | Порты/адаптеры для GitHub и GitLab; MVP можно поэтапно выпускать | Да: какие адаптеры обязательны в первой поставке |
-| Публикация | `draft_only` по умолчанию, per-repo policy для auto-publish | Да: кто утверждает, когда разрешена автопубликация и merge gate |
-| Контекст | Четыре уровня с бюджетом; diff обязателен, AST выборочный | Да: языки MVP и parser/type-index глубина |
-| Retention | Минимизировать постоянное хранение исходников; временный cache TTL предложен 24 часа | Да: сроки для context, findings, logs и право удаления |
-| NFR | Стартовые значения раздела 12 | Да: нагрузка, задержка, доступность и стоимость на review |
-| Authentication | Пользовательская auth + tenant/repo RBAC; VCS credentials только backend | Да: identity provider и модель multi-tenancy |
-| Триггеры и диалог | Нормализованный trigger contract; thread reply как отдельный follow-up | Да: какие из quick action/mention/dialog входят в MVP и в какие сроки |
-| Project context | MR intent, repo rules и релевантные существующие comments с версиями/digests | Да: формат правил, precedence и объём истории обсуждений |
-| LLM privacy | Проверять capabilities/terms провайдера; не полагаться на флаг ZDR без подтверждения | Да: допустимые модели, retention и запрет обучения |
-| Deployment | Контейнеры в приватной сети поддерживаются архитектурно | Да: Hetzner/staging topology, managed или self-hosted компоненты |
-
-## 15. Критерии готовности системного дизайна
-
-- [x] Описаны контейнеры/компоненты, потоки данных и границы frontend/backend/LLM/VCS.
-- [x] Определены рекомендуемая очередь, версия сообщения, retry/idempotency и стратегия кэширования.
-- [x] Описаны payload-структуры для Diff, Surrounding, Whole File и AST/Imports.
-- [x] Заданы стартовые проверяемые latency/context limits и отмечено, что они требуют валидации.
-- [ ] Команда подтвердила открытые решения и начальные SLO.
-- [ ] Команда утвердила документ; до этого статус остаётся «Черновик для командного утверждения».
